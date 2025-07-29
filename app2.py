@@ -90,7 +90,7 @@ def procesar_fifo(file):
                 nueva_linea = row.copy()
                 nueva_linea['commodity code'] = fila_minuta[col_fraccion]
                 nueva_linea['commodity code3'] = fila_minuta[col_desc_fraccion]
-                nueva_linea['net price'] = fila_minuta[col_precio]  # Se actualiza Net Price
+                nueva_linea['net price'] = fila_minuta[col_precio]  # Actualiza Net Price
                 nueva_linea['linea tipo'] = 'línea de sse'
                 result_ci.append(nueva_linea)
 
@@ -118,6 +118,15 @@ def procesar_fifo(file):
             result_ci.append(nueva_linea_maquila)
 
     ci_modificado = pd.DataFrame(result_ci)
+
+    # === 5. Marcar líneas fraccionadas ===
+    if 'document' in ci_modificado.columns and 'item' in ci_modificado.columns:
+        ci_modificado['Fraccionada'] = ci_modificado.duplicated(subset=['document', 'item'], keep=False)
+    else:
+        ci_modificado['Fraccionada'] = False
+
+    ci_modificado['Fraccionada'] = ci_modificado['Fraccionada'].apply(lambda x: 'Sí' if x else 'No')
+
     minuta_actualizada = minuta_saldos
 
     return ci_modificado, minuta_actualizada
