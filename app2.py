@@ -7,15 +7,10 @@ from io import BytesIO
 # ==============================
 
 def normalizar_columnas(df):
-    """Convierte columnas a minúsculas y sin espacios inicial/final"""
     df.columns = df.columns.str.strip().str.lower()
     return df
 
 def encontrar_columna(df, keyword):
-    """
-    Busca una columna que contenga el texto 'keyword' en su nombre.
-    Lanza error amigable si no la encuentra.
-    """
     for col in df.columns:
         if keyword in col:
             return col
@@ -25,11 +20,11 @@ def encontrar_columna(df, keyword):
 # PROCESO FIFO
 # ==============================
 def procesar_fifo(file):
-    # === 1. Leer el archivo
+    # Leer archivo
     minuta = pd.read_excel(file, sheet_name="Minuta")
     ci = pd.read_excel(file, sheet_name="CI")
 
-    # Normalizar nombres de columnas
+    # Normalizar columnas
     minuta = normalizar_columnas(minuta)
     ci = normalizar_columnas(ci)
 
@@ -44,93 +39,91 @@ def procesar_fifo(file):
     col_desc_ci = encontrar_columna(ci, "des no custom")
     col_qty_ci = encontrar_columna(ci, "delivery quantity")
 
-    # Normalizar valores de búsqueda
+    # Normalizar valores
     minuta[col_desc_minuta] = minuta[col_desc_minuta].astype(str).str.strip().str.lower()
     ci[col_desc_ci] = ci[col_desc_ci].astype(str).str.strip().str.lower()
 
-    # Aseguramos columnas en CI (Net Price ya existe y la actualizaremos)
+    # Asegurar columnas extra en CI
     if 'net price' not in ci.columns:
         ci['net price'] = None
-
     if 'commodity code3' not in ci.columns:
         ci['commodity code3'] = None
 
     ci['linea tipo'] = None
 
-    # Clonar minuta para actualizar saldos
     minuta_saldos = minuta.copy()
     result_ci = []
 
-    # === 4. Lógica FIFO ===
+    # === Lógica FIFO por línea de CI ===
     for _, row in ci.iterrows():
         producto = row[col_desc_ci]
         qty_needed = row[col_qty_ci]
+        partes_ci = []  # Guardar fragmentos para marcar Fraccionada
 
-        # Filtrar minuta para ese producto
+        # Filtrar minuta para ese producto (FIFO)
         filtro_producto = minuta_saldos[minuta_saldos[col_desc_minuta] == producto]
 
-        if filtro_producto.empty:
-            # No existe en minuta → línea maquila
-            nueva_linea = row.copy()
-            nueva_linea['linea tipo'] = 'línea de maquila'
-            result_ci.append(nueva_linea)
-            continue
-
-        # Recorrer filas FIFO
+        # Consumir saldo en orden hasta completar o agotar
         for i_m, fila_minuta in filtro_producto.iterrows():
             saldo = minuta_saldos.at[i_m, col_saldo_minuta]
-
             if saldo <= 0:
                 continue
 
+            if qty_needed <= 0:
+                break
+
             if qty_needed <= saldo:
-                # Se puede surtir todo
+                # Consumir solo lo que necesito
                 minuta_saldos.at[i_m, col_saldo_minuta] -= qty_needed
 
                 nueva_linea = row.copy()
+                nueva_linea['delivery quantity'] = qty_needed
                 nueva_linea['commodity code'] = fila_minuta[col_fraccion]
                 nueva_linea['commodity code3'] = fila_minuta[col_desc_fraccion]
-                nueva_linea['net price'] = fila_minuta[col_precio]  # Actualiza Net Price
+                nueva_linea['net price'] = fila_minuta[col_precio]
                 nueva_linea['linea tipo'] = 'línea de sse'
-                result_ci.append(nueva_linea)
-
+                partes_ci.append(nueva_linea)
                 qty_needed = 0
                 break
             else:
-                # Fraccionar
+                # Consumir todo el saldo y seguir buscando
                 nueva_linea_sse = row.copy()
-                nueva_linea_sse[col_qty_ci] = saldo
+                nueva_linea_sse['delivery quantity'] = saldo
                 nueva_linea_sse['commodity code'] = fila_minuta[col_fraccion]
                 nueva_linea_sse['commodity code3'] = fila_minuta[col_desc_fraccion]
                 nueva_linea_sse['net price'] = fila_minuta[col_precio]
                 nueva_linea_sse['linea tipo'] = 'línea de sse'
-                result_ci.append(nueva_linea_sse)
+                partes_ci.append(nueva_linea_sse)
 
-                # Reducir saldo
-                minuta_saldos.at[i_m, col_saldo_minuta] = 0
                 qty_needed -= saldo
+                minuta_saldos.at[i_m, col_saldo_minuta] = 0
 
-        # Si falta cantidad → maquila
+        # Si faltó cantidad → Maquila (precio original del CI)
         if qty_needed > 0:
             nueva_linea_maquila = row.copy()
-            nueva_linea_maquila[col_qty_ci] = qty_needed
+            nueva_linea_maquila['delivery quantity'] = qty_needed
             nueva_linea_maquila['linea tipo'] = 'línea de maquila'
-            result_ci.append(nueva_linea_maquila)
+            partes_ci.append(nueva_linea_maquila)
+
+        # Marcar fraccionada = Sí si hay más de 1 fragmento
+        if len(partes_ci) > 1:
+            for frag in partes_ci:
+                frag['Fraccionada'] = 'Sí'
+        else:
+            for frag in partes_ci:
+                frag['Fraccionada'] = 'No'
+
+        result_ci.extend(partes_ci)
 
     ci_modificado = pd.DataFrame(result_ci)
 
-    # === 5. Marcar líneas fraccionadas ===
+    # Ordenar por Document + Item para mantener fragmentos juntos
     if 'document' in ci_modificado.columns and 'item' in ci_modificado.columns:
-        ci_modificado['Fraccionada'] = ci_modificado.duplicated(subset=['document', 'item'], keep=False)
-    else:
-        ci_modificado['Fraccionada'] = False
-
-    ci_modificado['Fraccionada'] = ci_modificado['Fraccionada'].apply(lambda x: 'Sí' if x else 'No')
+        ci_modificado = ci_modificado.sort_values(by=['document', 'item']).reset_index(drop=True)
 
     minuta_actualizada = minuta_saldos
 
     return ci_modificado, minuta_actualizada
-
 
 # ==============================
 # INTERFAZ STREAMLIT
@@ -149,14 +142,14 @@ if file:
 
     st.success("¡Procesamiento completado!")
 
-    # Mostrar vistas previas
+    # Vista previa
     st.subheader("Vista previa - CI modificado")
-    st.dataframe(ci_modificado.head(20))
+    st.dataframe(ci_modificado.head(30))
 
     st.subheader("Vista previa - Minuta actualizada")
-    st.dataframe(minuta_actualizada.head(20))
+    st.dataframe(minuta_actualizada.head(30))
 
-    # Función para exportar a Excel
+    # Función exportar Excel
     def export_excel(df):
         output = BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
